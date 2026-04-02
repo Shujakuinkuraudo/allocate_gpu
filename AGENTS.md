@@ -34,6 +34,12 @@ gpu-alloc 1_gpu,40G -- pixi run uv run -- python train.py
 pixi global install --environment gpu-alloc --path "$(pwd)" --expose gpu-alloc=gpu-alloc
 ```
 
+- Install from the public GitHub repo with:
+
+```bash
+pixi global install --environment gpu-alloc --git https://github.com/Shujakuinkuraudo/allocate_gpu.git --expose gpu-alloc=gpu-alloc
+```
+
 ## Implementation Notes
 
 - The preferred CLI input is the positional allocation spec:
@@ -71,3 +77,5 @@ pixi global install --environment gpu-alloc --path "$(pwd)" --expose gpu-alloc=g
 - For real-machine validation, compare:
   - raw query output from `nvidia-smi --query-gpu=...`
   - allocator output from `gpu-alloc ... --print-only`
+- Plain `pixi global install gpu-alloc` requires publishing the built conda
+  package to a searchable channel; repository changes alone are not sufficient

@@ -45,6 +45,20 @@ Install the current project as a globally exposed command:
 pixi global install --environment gpu-alloc --path "$(pwd)" --expose gpu-alloc=gpu-alloc
 ```
 
+Install directly from the public GitHub repository:
+
+```bash
+pixi global install --environment gpu-alloc --git https://github.com/Shujakuinkuraudo/allocate_gpu.git --expose gpu-alloc=gpu-alloc
+```
+
+Notes:
+
+- `pixi global install https://github.com/...` is not supported by pixi. Use
+  `--git <url>` instead.
+- `pixi global install gpu-alloc` is not available yet because that requires
+  publishing the built package to a searchable conda channel such as
+  prefix.dev, anaconda.org, or conda-forge.
+
 After that, the preferred command shape is:
 
 ```bash
