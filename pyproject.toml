@@ -1,0 +1,12 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools>=68"]
+
+[project]
+name = "gpu-alloc"
+version = "0.1.0"
+description = "Allocate CUDA_VISIBLE_DEVICES based on free GPU memory and utilization."
+requires-python = ">=3.10"
+
+[project.scripts]
+gpu-alloc = "gpu_alloc.cli:main"

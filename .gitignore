@@ -1,0 +1,6 @@
+.codex/
+.gpu-alloc/
+.pixi/
+.venv/
+__pycache__/
+*.egg-info/

@@ -1,0 +1,35 @@
+[workspace]
+authors = ["YunyaoZhou <admin@shujk.top>"]
+channels = ["conda-forge"]
+description = "Allocate CUDA_VISIBLE_DEVICES based on free GPU memory and utilization."
+name = "allocate-gpu"
+platforms = ["linux-64"]
+preview = ["pixi-build"]
+readme = "README.md"
+version = "0.1.0"
+
+[package]
+name = "gpu-alloc"
+version = "0.1.0"
+description = "Allocate CUDA_VISIBLE_DEVICES based on free GPU memory and utilization."
+
+[package.build.backend]
+name = "pixi-build-python"
+version = "0.4.*"
+channels = [
+  "https://prefix.dev/pixi-build-backends",
+  "https://prefix.dev/conda-forge",
+]
+
+[package.host-dependencies]
+setuptools = ">=68"
+
+[package.run-dependencies]
+python = ">=3.10,<3.13"
+
+[tasks]
+gpu-alloc = "python -m gpu_alloc"
+test = "python -m unittest discover -s tests -t . -v"
+
+[dependencies]
+python = ">=3.10,<3.13"
