@@ -8,16 +8,21 @@ import json
 import math
 import os
 import re
+import shlex
 import signal
+import smtplib
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from email.message import EmailMessage
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 REQUEST_PATTERN = re.compile(
     r"^\s*(?:allocate\s*=\s*)?(?P<count>\d+)\s*_gpu\s*,\s*"
@@ -115,6 +120,19 @@ class AllocatorConfig:
 class AllocationDecision:
     selection: SelectionResult
     lease: LeaseRecord | None
+
+
+@dataclass(frozen=True)
+class EmailNotificationConfig:
+    smtp_host: str
+    smtp_port: int
+    from_addr: str
+    to_addrs: tuple[str, ...]
+    username: str | None = None
+    password: str | None = None
+    use_ssl: bool = False
+    use_starttls: bool = False
+    subject_prefix: str = ""
 
 
 def parse_allocate_spec(spec: str) -> AllocationRequest:
@@ -476,6 +494,104 @@ class LeaseHeartbeat:
                     return
 
 
+def load_email_notification_config(env: Mapping[str, str]) -> EmailNotificationConfig | None:
+    if not _parse_bool_env("GPU_ALLOC_EMAIL_ENABLED", env.get("GPU_ALLOC_EMAIL_ENABLED")):
+        return None
+
+    use_ssl = _parse_bool_env("GPU_ALLOC_EMAIL_SMTP_USE_SSL", env.get("GPU_ALLOC_EMAIL_SMTP_USE_SSL"))
+    use_starttls = _parse_bool_env(
+        "GPU_ALLOC_EMAIL_SMTP_USE_STARTTLS",
+        env.get("GPU_ALLOC_EMAIL_SMTP_USE_STARTTLS"),
+    )
+    if use_ssl and use_starttls:
+        raise AllocationError("GPU_ALLOC_EMAIL_SMTP_USE_SSL and GPU_ALLOC_EMAIL_SMTP_USE_STARTTLS cannot both be enabled.")
+
+    required_names = [
+        "GPU_ALLOC_EMAIL_SMTP_HOST",
+        "GPU_ALLOC_EMAIL_SMTP_FROM",
+        "GPU_ALLOC_EMAIL_SMTP_TO",
+    ]
+    missing = [name for name in required_names if not env.get(name, "").strip()]
+    if missing:
+        raise AllocationError(
+            "Email notifications are enabled but these environment variables are missing: "
+            + ", ".join(missing)
+            + "."
+        )
+
+    port_value = env.get("GPU_ALLOC_EMAIL_SMTP_PORT")
+    if port_value is None or not port_value.strip():
+        smtp_port = 465 if use_ssl else 587
+    else:
+        try:
+            smtp_port = int(port_value)
+        except ValueError as exc:
+            raise AllocationError(f"Invalid GPU_ALLOC_EMAIL_SMTP_PORT value: {port_value!r}.") from exc
+        if smtp_port <= 0:
+            raise AllocationError("GPU_ALLOC_EMAIL_SMTP_PORT must be greater than zero.")
+
+    username_value = env.get("GPU_ALLOC_EMAIL_SMTP_USERNAME")
+    password_value = env.get("GPU_ALLOC_EMAIL_SMTP_PASSWORD")
+    username = username_value.strip() if username_value is not None else ""
+    password = password_value if password_value is not None else ""
+    if bool(username) != bool(password):
+        raise AllocationError(
+            "Set both GPU_ALLOC_EMAIL_SMTP_USERNAME and GPU_ALLOC_EMAIL_SMTP_PASSWORD, or leave both unset."
+        )
+
+    to_addrs = tuple(item.strip() for item in env["GPU_ALLOC_EMAIL_SMTP_TO"].split(",") if item.strip())
+    if not to_addrs:
+        raise AllocationError("GPU_ALLOC_EMAIL_SMTP_TO must contain at least one recipient address.")
+
+    return EmailNotificationConfig(
+        smtp_host=env["GPU_ALLOC_EMAIL_SMTP_HOST"].strip(),
+        smtp_port=smtp_port,
+        from_addr=env["GPU_ALLOC_EMAIL_SMTP_FROM"].strip(),
+        to_addrs=to_addrs,
+        username=username or None,
+        password=password or None,
+        use_ssl=use_ssl,
+        use_starttls=use_starttls,
+        subject_prefix=env.get("GPU_ALLOC_EMAIL_SUBJECT_PREFIX", "").strip(),
+    )
+
+
+def send_completion_email_notification(
+    config: EmailNotificationConfig,
+    *,
+    command: Sequence[str],
+    gpu_ids: Sequence[int],
+    cuda_visible_devices: str,
+    start_time: float,
+    end_time: float,
+    exit_code: int | None = None,
+    launch_error: BaseException | None = None,
+) -> None:
+    message = EmailMessage()
+    message["From"] = config.from_addr
+    message["To"] = ", ".join(config.to_addrs)
+    message["Subject"] = _build_email_subject(config, exit_code=exit_code, launch_error=launch_error)
+    message.set_content(
+        _build_email_body(
+            command=command,
+            gpu_ids=gpu_ids,
+            cuda_visible_devices=cuda_visible_devices,
+            start_time=start_time,
+            end_time=end_time,
+            exit_code=exit_code,
+            launch_error=launch_error,
+        )
+    )
+
+    smtp_class = smtplib.SMTP_SSL if config.use_ssl else smtplib.SMTP
+    with smtp_class(config.smtp_host, config.smtp_port, timeout=30) as client:
+        if config.use_starttls:
+            client.starttls()
+        if config.username is not None:
+            client.login(config.username, config.password or "")
+        client.send_message(message)
+
+
 def run_command_with_lease(
     command: Sequence[str],
     *,
@@ -483,8 +599,19 @@ def run_command_with_lease(
     lease_store: LeaseStore,
     lease: LeaseRecord,
     lease_seconds: float,
+    gpu_ids: Sequence[int],
+    cuda_visible_devices: str,
 ) -> int:
-    child = subprocess.Popen(list(command), env=env)
+    try:
+        notification_config = load_email_notification_config(env)
+    except AllocationError as exc:
+        print(f"Email notification disabled: {exc}", file=sys.stderr)
+        notification_config = None
+
+    start_time = time.time()
+    child = None
+    exit_code: int | None = None
+    launch_error: BaseException | None = None
     handled_signals = [signal.SIGINT, signal.SIGTERM]
     if hasattr(signal, "SIGHUP"):
         handled_signals.append(signal.SIGHUP)
@@ -494,15 +621,104 @@ def run_command_with_lease(
         if child.poll() is None:
             child.send_signal(signum)
 
-    for signum in handled_signals:
-        previous_handlers[signum] = signal.getsignal(signum)
-        signal.signal(signum, _forward)
-
     try:
+        try:
+            child = subprocess.Popen(list(command), env=env)
+        except OSError as exc:
+            launch_error = exc
+            raise
+
+        for signum in handled_signals:
+            previous_handlers[signum] = signal.getsignal(signum)
+            signal.signal(signum, _forward)
+
         with LeaseHeartbeat(lease_store, lease, lease_seconds):
-            return child.wait()
+            exit_code = child.wait()
+            return exit_code
     finally:
         for signum, handler in previous_handlers.items():
             signal.signal(signum, handler)
         with lease_store.locked():
             lease_store.release(lease.lease_id)
+        if notification_config is not None and (exit_code is not None or launch_error is not None):
+            end_time = time.time()
+            try:
+                send_completion_email_notification(
+                    notification_config,
+                    command=command,
+                    gpu_ids=gpu_ids,
+                    cuda_visible_devices=cuda_visible_devices,
+                    start_time=start_time,
+                    end_time=end_time,
+                    exit_code=exit_code,
+                    launch_error=launch_error,
+                )
+            except Exception as exc:  # pragma: no cover - best-effort notification path
+                print(f"Warning: failed to send completion email: {exc}", file=sys.stderr)
+
+
+def _parse_bool_env(name: str, value: str | None) -> bool:
+    if value is None:
+        return False
+    normalized = value.strip().lower()
+    if normalized in {"", "0", "false", "no", "off"}:
+        return False
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    raise AllocationError(
+        f"Invalid boolean value for {name}: {value!r}. Use one of 1, true, yes, on, 0, false, no, off."
+    )
+
+
+def _build_email_subject(
+    config: EmailNotificationConfig,
+    *,
+    exit_code: int | None,
+    launch_error: BaseException | None,
+) -> str:
+    status = _notification_status(exit_code=exit_code, launch_error=launch_error)
+    subject = f"gpu-alloc job finished: {status}"
+    if config.subject_prefix:
+        return f"[{config.subject_prefix}] {subject}"
+    return subject
+
+
+def _build_email_body(
+    *,
+    command: Sequence[str],
+    gpu_ids: Sequence[int],
+    cuda_visible_devices: str,
+    start_time: float,
+    end_time: float,
+    exit_code: int | None,
+    launch_error: BaseException | None,
+) -> str:
+    lines = [
+        f"Status: {_notification_status(exit_code=exit_code, launch_error=launch_error)}",
+        f"Exit code: {exit_code if exit_code is not None else 'N/A'}",
+        f"Command: {shlex.join(command)}",
+        f"GPU IDs: {', '.join(str(item) for item in gpu_ids)}",
+        f"CUDA_VISIBLE_DEVICES: {cuda_visible_devices}",
+        f"Started at: {_format_local_timestamp(start_time)}",
+        f"Finished at: {_format_local_timestamp(end_time)}",
+        f"Duration: {_format_duration(end_time - start_time)}",
+    ]
+    if launch_error is not None:
+        lines.append(f"Launch error: {launch_error}")
+    return "\n".join(lines) + "\n"
+
+
+def _notification_status(*, exit_code: int | None, launch_error: BaseException | None) -> str:
+    if launch_error is not None:
+        return "launch failed"
+    if exit_code == 0:
+        return "success"
+    return "failed"
+
+
+def _format_local_timestamp(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp).astimezone().isoformat(sep=" ", timespec="seconds")
+
+
+def _format_duration(seconds: float) -> str:
+    return f"{seconds:.1f}s"

@@ -37,6 +37,52 @@ ALLOCATE=2_gpu,24G gpu-alloc --print-only
 The `--print-only` mode prints `CUDA_VISIBLE_DEVICES=...` and does not create a
 lease, so it is useful for inspection but not for race-free reservation.
 
+Common CLI defaults can also come from environment variables:
+
+```bash
+export GPU_ALLOC_MEMORY_MARGIN=1.5
+export GPU_ALLOC_UTILIZATION_THRESHOLD=30
+export GPU_ALLOC_POLL_INTERVAL=10
+export GPU_ALLOC_LEASE_SECONDS=120
+```
+
+CLI flags still take precedence over these environment defaults.
+
+## Email Notification
+
+`gpu-alloc` can send a summary email after the child command finishes. This is
+configured entirely through environment variables.
+
+Required variables:
+
+```bash
+export GPU_ALLOC_EMAIL_ENABLED=1
+export GPU_ALLOC_EMAIL_SMTP_HOST=smtp.example.com
+export GPU_ALLOC_EMAIL_SMTP_FROM=bot@example.com
+export GPU_ALLOC_EMAIL_SMTP_TO=you@example.com
+```
+
+Optional variables:
+
+```bash
+export GPU_ALLOC_EMAIL_SMTP_PORT=587
+export GPU_ALLOC_EMAIL_SMTP_USERNAME=bot@example.com
+export GPU_ALLOC_EMAIL_SMTP_PASSWORD=secret
+export GPU_ALLOC_EMAIL_SMTP_USE_SSL=0
+export GPU_ALLOC_EMAIL_SMTP_USE_STARTTLS=1
+export GPU_ALLOC_EMAIL_SUBJECT_PREFIX=train
+```
+
+Behavior notes:
+
+- The email is sent after the child command exits, regardless of success or
+  failure.
+- `--print-only` does not send email because no child command is launched.
+- Notification setup errors or SMTP delivery failures are reported to `stderr`
+  and do not change the child command exit code.
+- If `GPU_ALLOC_EMAIL_SMTP_PORT` is unset, the default is `465` for SSL and
+  `587` otherwise.
+
 ## Pixi Global Install
 
 Install the current project as a globally exposed command:
@@ -73,6 +119,9 @@ gpu-alloc 1_gpu,40G -- pixi run uv run -- python 1.py
 - Poll interval: `10s`
 - Lease TTL: `120s`, refreshed while the child process is alive
 - Lease directory: `./.gpu-alloc`
+- CLI env defaults: `GPU_ALLOC_MEMORY_MARGIN`, `GPU_ALLOC_UTILIZATION_THRESHOLD`,
+  `GPU_ALLOC_POLL_INTERVAL`, `GPU_ALLOC_LEASE_SECONDS`
+- Email notification: disabled unless `GPU_ALLOC_EMAIL_ENABLED=1`
 
 ## Development
 

@@ -47,26 +47,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--poll-interval",
         type=float,
-        default=10.0,
-        help="Seconds between retries while waiting for GPUs. Default: 10.",
+        default=_env_default_float("GPU_ALLOC_POLL_INTERVAL", 10.0),
+        help="Seconds between retries while waiting for GPUs. Default: 10 or $GPU_ALLOC_POLL_INTERVAL if set.",
     )
     parser.add_argument(
         "--memory-margin",
         type=float,
-        default=1.5,
-        help="Safety factor applied to the requested memory. Default: 1.5.",
+        default=_env_default_float("GPU_ALLOC_MEMORY_MARGIN", 1.5),
+        help="Safety factor applied to the requested memory. Default: 1.5 or $GPU_ALLOC_MEMORY_MARGIN if set.",
     )
     parser.add_argument(
         "--utilization-threshold",
         type=int,
-        default=30,
-        help="Maximum utilization.gpu value for an eligible device. Default: 30.",
+        default=_env_default_int("GPU_ALLOC_UTILIZATION_THRESHOLD", 30),
+        help="Maximum utilization.gpu value for an eligible device. Default: 30 or $GPU_ALLOC_UTILIZATION_THRESHOLD if set.",
     )
     parser.add_argument(
         "--lease-seconds",
         type=float,
-        default=120.0,
-        help="Lease TTL in seconds. Default: 120.",
+        default=_env_default_float("GPU_ALLOC_LEASE_SECONDS", 120.0),
+        help="Lease TTL in seconds. Default: 120 or $GPU_ALLOC_LEASE_SECONDS if set.",
     )
     parser.add_argument(
         "--state-dir",
@@ -96,6 +96,26 @@ def normalize_command(command: Sequence[str]) -> list[str]:
     return values
 
 
+def _env_default_float(name: str, fallback: float) -> float:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return fallback
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise AllocationError(f"Invalid {name} value: {value!r}. Expected a number.") from exc
+
+
+def _env_default_int(name: str, fallback: int) -> int:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return fallback
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise AllocationError(f"Invalid {name} value: {value!r}. Expected an integer.") from exc
+
+
 def resolve_allocate_value(
     positional_value: str | None,
     option_value: str | None,
@@ -112,15 +132,15 @@ def resolve_allocate_value(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    parser_args, command_args = split_command(argv)
-    args = parser.parse_args(parser_args)
-    command = normalize_command(command_args)
-
-    if not args.print_only and not command:
-        parser.error("a child command is required unless --print-only is set")
-
     try:
+        parser = build_parser()
+        parser_args, command_args = split_command(argv)
+        args = parser.parse_args(parser_args)
+        command = normalize_command(command_args)
+
+        if not args.print_only and not command:
+            parser.error("a child command is required unless --print-only is set")
+
         allocate_value = resolve_allocate_value(args.allocate_spec, args.allocate, os.environ)
         request = parse_allocate_spec(allocate_value)
         config = AllocatorConfig(
@@ -158,4 +178,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         lease_store=lease_store,
         lease=decision.lease,
         lease_seconds=args.lease_seconds,
+        gpu_ids=decision.selection.gpu_ids,
+        cuda_visible_devices=cuda_visible_devices,
     )
