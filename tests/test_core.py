@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from gpu_alloc.core import (
     AllocationRequest,
     AllocationUnavailable,
+    AllocationStatus,
     AllocatorConfig,
     EmailNotificationConfig,
     GPUAllocator,
@@ -16,6 +19,8 @@ from gpu_alloc.core import (
     LeaseStore,
     ProbeError,
     NvidiaSmiProbe,
+    _process_matches,
+    format_status_line,
     load_email_notification_config,
     parse_allocate_spec,
     run_command_with_lease,
@@ -60,7 +65,7 @@ class NvidiaSmiProbeTests(unittest.TestCase):
 
 
 class SelectGpuTests(unittest.TestCase):
-    def test_prefers_low_utilization_then_more_free_memory(self) -> None:
+    def test_pack_prefers_low_utilization_then_more_free_memory(self) -> None:
         request = AllocationRequest(gpu_count=2, memory_mib=40960, raw="2_gpu,40G")
         gpus = [
             GPUInfo(index=0, name="A", total_mib=81920, free_mib=62000, utilization_gpu=20),
@@ -74,10 +79,31 @@ class SelectGpuTests(unittest.TestCase):
             reserved_ids=[2],
             memory_margin=1.5,
             utilization_threshold=30,
+            strategy="pack",
         )
 
         self.assertIsNotNone(selection)
+        assert selection is not None
         self.assertEqual(selection.gpu_ids, (1, 0))
+
+    def test_spread_prefers_more_free_memory_first(self) -> None:
+        request = AllocationRequest(gpu_count=1, memory_mib=1024, raw="1_gpu,1G")
+        gpus = [
+            GPUInfo(index=0, name="A", total_mib=81920, free_mib=62000, utilization_gpu=1),
+            GPUInfo(index=1, name="B", total_mib=81920, free_mib=70000, utilization_gpu=20),
+        ]
+
+        selection = select_gpus(
+            gpus,
+            request,
+            memory_margin=1.0,
+            utilization_threshold=30,
+            strategy="spread",
+        )
+
+        self.assertIsNotNone(selection)
+        assert selection is not None
+        self.assertEqual(selection.gpu_ids, (1,))
 
 
 class LeaseStoreTests(unittest.TestCase):
@@ -85,9 +111,23 @@ class LeaseStoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = LeaseStore(temp_dir)
             with store.locked():
-                lease = store.create_lease([0], ["python"], lease_seconds=10, pid=999999)
+                lease = store.create_lease([0], ["python"], lease_seconds=10, pid=999999, process_start_time=1)
                 leases = store.load_active_leases()
             self.assertNotIn(lease.lease_id, leases)
+
+    def test_uses_one_file_per_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LeaseStore(temp_dir)
+            with store.locked():
+                lease = store.create_lease([0], ["python"], lease_seconds=10)
+            self.assertTrue((Path(temp_dir) / "leases" / f"{lease.lease_id}.json").exists())
+
+
+class ProcessLivenessTests(unittest.TestCase):
+    def test_process_matches_when_start_time_matches(self) -> None:
+        pid = os.getpid()
+        start_time = __import__("gpu_alloc.core", fromlist=["_get_process_start_time"])._get_process_start_time(pid)
+        self.assertTrue(_process_matches(pid, start_time))
 
 
 class GPUAllocatorTests(unittest.TestCase):
@@ -123,6 +163,75 @@ class GPUAllocatorTests(unittest.TestCase):
             allocator = GPUAllocator(FakeProbe(), LeaseStore(temp_dir), config)
             with self.assertRaises(AllocationUnavailable):
                 allocator.allocate(request, command=["python"], wait=False, reserve=False)
+
+    def test_watch_callback_receives_status(self) -> None:
+        request = AllocationRequest(gpu_count=1, memory_mib=40960, raw="1_gpu,40G")
+        config = AllocatorConfig(
+            memory_margin=1.5,
+            utilization_threshold=30,
+            poll_interval=0.01,
+            lease_seconds=60,
+            watch=True,
+            watch_interval=0.0,
+        )
+
+        class FakeProbe:
+            def query(self):
+                return [GPUInfo(index=0, name="A", total_mib=81920, free_mib=50000, utilization_gpu=5)]
+
+        statuses: list[AllocationStatus] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            allocator = GPUAllocator(FakeProbe(), LeaseStore(temp_dir), config)
+            with self.assertRaises(AllocationUnavailable):
+                allocator.allocate(
+                    request,
+                    command=["python"],
+                    wait=False,
+                    reserve=False,
+                    status_callback=statuses.append,
+                )
+        self.assertEqual(statuses, [])
+
+    def test_explain_reports_reserved_and_eligible(self) -> None:
+        request = AllocationRequest(gpu_count=1, memory_mib=1024, raw="1_gpu,1G")
+
+        class FakeProbe:
+            def query(self):
+                return [
+                    GPUInfo(index=0, name="A", total_mib=81920, free_mib=70000, utilization_gpu=5),
+                    GPUInfo(index=1, name="B", total_mib=81920, free_mib=70000, utilization_gpu=5),
+                ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = LeaseStore(temp_dir)
+            with store.locked():
+                store.create_lease([1], ["python"], lease_seconds=60)
+            allocator = GPUAllocator(FakeProbe(), store, AllocatorConfig(memory_margin=1.0, utilization_threshold=30))
+            status = allocator.explain(request)
+        self.assertEqual(status.reserved_ids, (1,))
+        self.assertEqual(status.eligible_ids, (0,))
+
+
+class StatusFormattingTests(unittest.TestCase):
+    def test_format_status_line_verbose(self) -> None:
+        status = AllocationStatus(
+            request=AllocationRequest(gpu_count=1, memory_mib=1024, raw="1_gpu,1G"),
+            required_free_mib=1024,
+            utilization_threshold=30,
+            reserved_ids=(1,),
+            eligible_ids=(0,),
+            gpus=(
+                GPUInfo(index=0, name="A", total_mib=81920, free_mib=70000, utilization_gpu=5),
+                GPUInfo(index=1, name="B", total_mib=81920, free_mib=70000, utilization_gpu=5),
+            ),
+            next_retry_in=10.0,
+            attempt=2,
+            strategy="pack",
+        )
+        line = format_status_line(status, verbose=True)
+        self.assertIn("attempt=2", line)
+        self.assertIn("candidates=[", line)
+        self.assertIn("eligible", line)
 
 
 class EmailNotificationConfigTests(unittest.TestCase):
@@ -232,13 +341,14 @@ class RunCommandWithLeaseTests(unittest.TestCase):
         child = mock.Mock()
         child.wait.return_value = 7
         child.poll.return_value = None
+        child.pid = 1234
 
         with tempfile.TemporaryDirectory() as temp_dir:
             store = LeaseStore(temp_dir)
             with store.locked():
                 lease = store.create_lease([0], ["python", "train.py"], lease_seconds=10)
 
-            with mock.patch("gpu_alloc.core.subprocess.Popen", return_value=child):
+            with mock.patch("gpu_alloc.core.subprocess.Popen", return_value=child) as popen:
                 with mock.patch("gpu_alloc.core.LeaseHeartbeat", return_value=contextlib.nullcontext()):
                     with mock.patch("gpu_alloc.core.signal.getsignal", return_value=mock.sentinel.handler):
                         with mock.patch("gpu_alloc.core.signal.signal"):
@@ -253,6 +363,8 @@ class RunCommandWithLeaseTests(unittest.TestCase):
                                     cuda_visible_devices="0",
                                 )
 
+            popen.assert_called_once()
+            self.assertTrue(popen.call_args.kwargs["start_new_session"])
             self.assertEqual(exit_code, 7)
             self.assertEqual(sender.call_args.kwargs["exit_code"], 7)
             self.assertEqual(sender.call_args.kwargs["gpu_ids"], (0,))
@@ -269,6 +381,7 @@ class RunCommandWithLeaseTests(unittest.TestCase):
         child = mock.Mock()
         child.wait.return_value = 0
         child.poll.return_value = None
+        child.pid = 1234
 
         with tempfile.TemporaryDirectory() as temp_dir:
             store = LeaseStore(temp_dir)
@@ -302,6 +415,7 @@ class RunCommandWithLeaseTests(unittest.TestCase):
         child = mock.Mock()
         child.wait.return_value = 0
         child.poll.return_value = None
+        child.pid = 1234
 
         with tempfile.TemporaryDirectory() as temp_dir:
             store = LeaseStore(temp_dir)

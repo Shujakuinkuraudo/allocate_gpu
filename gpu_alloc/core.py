@@ -79,6 +79,7 @@ class LeaseRecord:
     lease_id: str
     gpu_ids: tuple[int, ...]
     pid: int
+    process_start_time: int
     command: tuple[str, ...]
     created_at: float
     updated_at: float
@@ -90,6 +91,7 @@ class LeaseRecord:
             lease_id=str(payload["lease_id"]),
             gpu_ids=tuple(int(item) for item in payload["gpu_ids"]),
             pid=int(payload["pid"]),
+            process_start_time=int(payload.get("process_start_time", 0)),
             command=tuple(str(item) for item in payload.get("command", [])),
             created_at=float(payload["created_at"]),
             updated_at=float(payload["updated_at"]),
@@ -101,6 +103,7 @@ class LeaseRecord:
             "lease_id": self.lease_id,
             "gpu_ids": list(self.gpu_ids),
             "pid": self.pid,
+            "process_start_time": self.process_start_time,
             "command": list(self.command),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -113,13 +116,58 @@ class AllocatorConfig:
     memory_margin: float = 1.5
     utilization_threshold: int = 30
     poll_interval: float = 10.0
-    lease_seconds: float = 120.0
+    lease_seconds: float = 45.0
+    strategy: str = "pack"
+    watch: bool = False
+    verbose: bool = False
+    watch_interval: float = 10.0
 
 
 @dataclass(frozen=True)
 class AllocationDecision:
     selection: SelectionResult
     lease: LeaseRecord | None
+
+
+@dataclass(frozen=True)
+class AllocationStatus:
+    request: AllocationRequest
+    required_free_mib: int
+    utilization_threshold: int
+    reserved_ids: tuple[int, ...]
+    eligible_ids: tuple[int, ...]
+    gpus: tuple[GPUInfo, ...]
+    next_retry_in: float
+    attempt: int
+    strategy: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "request": {
+                "gpu_count": self.request.gpu_count,
+                "memory_mib": self.request.memory_mib,
+                "raw": self.request.raw,
+            },
+            "required_free_mib": self.required_free_mib,
+            "utilization_threshold": self.utilization_threshold,
+            "reserved_ids": list(self.reserved_ids),
+            "eligible_ids": list(self.eligible_ids),
+            "next_retry_in": self.next_retry_in,
+            "attempt": self.attempt,
+            "strategy": self.strategy,
+            "gpus": [
+                {
+                    "index": gpu.index,
+                    "name": gpu.name,
+                    "total_mib": gpu.total_mib,
+                    "free_mib": gpu.free_mib,
+                    "utilization_gpu": gpu.utilization_gpu,
+                    "reserved": gpu.index in self.reserved_ids,
+                    "eligible": gpu.index in self.eligible_ids,
+                }
+                for gpu in self.gpus
+            ],
+        }
 
 
 @dataclass(frozen=True)
@@ -234,6 +282,7 @@ def select_gpus(
     reserved_ids: Iterable[int] = (),
     memory_margin: float,
     utilization_threshold: int,
+    strategy: str = "pack",
 ) -> SelectionResult | None:
     reserved = set(reserved_ids)
     required_free_mib = math.ceil(request.memory_mib * memory_margin)
@@ -244,7 +293,12 @@ def select_gpus(
         and gpu.free_mib >= required_free_mib
         and gpu.utilization_gpu <= utilization_threshold
     ]
-    eligible.sort(key=lambda gpu: (gpu.utilization_gpu, -gpu.free_mib, gpu.index))
+
+    if strategy == "spread":
+        eligible.sort(key=lambda gpu: (-gpu.free_mib, gpu.utilization_gpu, gpu.index))
+    else:
+        eligible.sort(key=lambda gpu: (gpu.utilization_gpu, -gpu.free_mib, gpu.index))
+
     if len(eligible) < request.gpu_count:
         return None
 
@@ -260,12 +314,15 @@ class LeaseStore:
     def __init__(self, directory: str | os.PathLike[str]):
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
-        self.state_path = self.directory / "leases.json"
+        self.leases_dir = self.directory / "leases"
+        self.leases_dir.mkdir(parents=True, exist_ok=True)
+        self.lock_path = self.directory / "leases.lock"
 
     @contextlib.contextmanager
     def locked(self):
         self.directory.mkdir(parents=True, exist_ok=True)
-        with self.state_path.open("a+", encoding="utf-8") as handle:
+        self.leases_dir.mkdir(parents=True, exist_ok=True)
+        with self.lock_path.open("a+", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             try:
                 yield
@@ -273,19 +330,18 @@ class LeaseStore:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def load_active_leases(self, now: float | None = None) -> dict[str, LeaseRecord]:
-        lease_records = self._read_records()
+        self.leases_dir.mkdir(parents=True, exist_ok=True)
         cleaned: dict[str, LeaseRecord] = {}
-        changed = False
         check_time = time.time() if now is None else now
-
-        for record in lease_records.values():
+        for path in sorted(self.leases_dir.glob("*.json")):
+            record = self._read_record(path)
+            if record is None:
+                path.unlink(missing_ok=True)
+                continue
             if self._is_stale(record, now=check_time):
-                changed = True
+                path.unlink(missing_ok=True)
                 continue
             cleaned[record.lease_id] = record
-
-        if changed:
-            self._write_records(cleaned)
         return cleaned
 
     def create_lease(
@@ -295,86 +351,96 @@ class LeaseStore:
         *,
         lease_seconds: float,
         pid: int | None = None,
+        process_start_time: int | None = None,
         now: float | None = None,
     ) -> LeaseRecord:
         check_time = time.time() if now is None else now
         owner_pid = os.getpid() if pid is None else pid
+        owner_start_time = _get_process_start_time(owner_pid) if process_start_time is None else process_start_time
         lease = LeaseRecord(
             lease_id=uuid.uuid4().hex,
             gpu_ids=tuple(int(item) for item in gpu_ids),
             pid=owner_pid,
+            process_start_time=owner_start_time,
             command=tuple(command),
             created_at=check_time,
             updated_at=check_time,
             expires_at=check_time + lease_seconds,
         )
-        records = self.load_active_leases(now=check_time)
-        records[lease.lease_id] = lease
-        self._write_records(records)
+        self._write_record(lease)
         return lease
 
     def renew_lease(self, lease_id: str, *, lease_seconds: float, now: float | None = None) -> LeaseRecord:
         check_time = time.time() if now is None else now
-        records = self.load_active_leases(now=check_time)
-        record = records.get(lease_id)
-        if record is None:
+        record = self._read_record(self._lease_path(lease_id))
+        if record is None or self._is_stale(record, now=check_time):
+            self.release(lease_id)
             raise AllocationError(f"Lease {lease_id} no longer exists.")
         updated = LeaseRecord(
             lease_id=record.lease_id,
             gpu_ids=record.gpu_ids,
             pid=record.pid,
+            process_start_time=record.process_start_time,
             command=record.command,
             created_at=record.created_at,
             updated_at=check_time,
             expires_at=check_time + lease_seconds,
         )
-        records[lease_id] = updated
-        self._write_records(records)
+        self._write_record(updated)
         return updated
 
     def release(self, lease_id: str) -> None:
-        records = self.load_active_leases()
-        if lease_id not in records:
-            return
-        del records[lease_id]
-        self._write_records(records)
+        self._lease_path(lease_id).unlink(missing_ok=True)
 
-    def _read_records(self) -> dict[str, LeaseRecord]:
-        if not self.state_path.exists() or self.state_path.stat().st_size == 0:
-            return {}
+    def _lease_path(self, lease_id: str) -> Path:
+        return self.leases_dir / f"{lease_id}.json"
+
+    def _read_record(self, path: Path) -> LeaseRecord | None:
+        if not path.exists():
+            return None
         try:
-            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise AllocationError(f"Invalid lease state file: {self.state_path}") from exc
-        leases = payload.get("leases", [])
-        return {str(item["lease_id"]): LeaseRecord.from_dict(item) for item in leases}
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None
+        return LeaseRecord.from_dict(payload)
 
-    def _write_records(self, records: dict[str, LeaseRecord]) -> None:
-        payload = {
-            "leases": [
-                records[lease_id].to_dict()
-                for lease_id in sorted(records)
-            ]
-        }
+    def _write_record(self, record: LeaseRecord) -> None:
+        path = self._lease_path(record.lease_id)
         with tempfile.NamedTemporaryFile(
             "w",
             encoding="utf-8",
-            dir=self.directory,
+            dir=self.leases_dir,
             delete=False,
         ) as temp_file:
-            json.dump(payload, temp_file, indent=2, sort_keys=True)
+            json.dump(record.to_dict(), temp_file, indent=2, sort_keys=True)
             temp_file.write("\n")
             temp_path = Path(temp_file.name)
-        temp_path.replace(self.state_path)
+        temp_path.replace(path)
 
     @staticmethod
     def _is_stale(record: LeaseRecord, *, now: float) -> bool:
         if record.expires_at <= now:
             return True
-        return not _pid_exists(record.pid)
+        return not _process_matches(record.pid, record.process_start_time)
 
 
-def _pid_exists(pid: int) -> bool:
+def _get_process_start_time(pid: int) -> int:
+    if pid <= 0:
+        return 0
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    parts = stat.split()
+    if len(parts) < 22:
+        return 0
+    try:
+        return int(parts[21])
+    except ValueError:
+        return 0
+
+
+def _process_matches(pid: int, start_time: int) -> bool:
     if pid <= 0:
         return False
     try:
@@ -383,7 +449,28 @@ def _pid_exists(pid: int) -> bool:
         if exc.errno == errno.ESRCH:
             return False
         return True
-    return True
+    current = _get_process_start_time(pid)
+    if start_time <= 0:
+        return current > 0
+    return current == start_time
+
+
+def format_status_line(status: AllocationStatus, *, verbose: bool = False) -> str:
+    base = (
+        f"[gpu-alloc] waiting attempt={status.attempt} request={status.request.raw} "
+        f"need_free>={status.required_free_mib}MiB max_util<={status.utilization_threshold}% "
+        f"eligible={list(status.eligible_ids) or 'none'} reserved={list(status.reserved_ids) or 'none'} "
+        f"next_retry_in={status.next_retry_in:.1f}s strategy={status.strategy}"
+    )
+    if not verbose:
+        return base
+    gpu_parts = [
+        f"{gpu.index}(free={gpu.free_mib}MiB util={gpu.utilization_gpu}%"
+        f"{' reserved' if gpu.index in status.reserved_ids else ''}"
+        f"{' eligible' if gpu.index in status.eligible_ids else ''})"
+        for gpu in status.gpus
+    ]
+    return f"{base} candidates=[{', '.join(gpu_parts)}]"
 
 
 class GPUAllocator:
@@ -399,8 +486,18 @@ class GPUAllocator:
         command: Sequence[str],
         wait: bool,
         reserve: bool,
+        status_callback=None,
     ) -> AllocationDecision:
+        attempt = 0
+        last_watch_time = 0.0
         while True:
+            attempt += 1
+            gpus = self.probe.query()
+            if len(gpus) < request.gpu_count:
+                raise AllocationUnavailable(
+                    f"Requested {request.gpu_count} GPUs, but only {len(gpus)} GPUs are visible."
+                )
+
             with self.lease_store.locked():
                 active_leases = self.lease_store.load_active_leases()
                 reserved_ids = sorted(
@@ -410,18 +507,13 @@ class GPUAllocator:
                         for gpu_id in lease.gpu_ids
                     }
                 )
-                gpus = self.probe.query()
-                if len(gpus) < request.gpu_count:
-                    raise AllocationUnavailable(
-                        f"Requested {request.gpu_count} GPUs, but only {len(gpus)} GPUs are visible."
-                    )
-
                 selection = select_gpus(
                     gpus,
                     request,
                     reserved_ids=reserved_ids,
                     memory_margin=self.config.memory_margin,
                     utilization_threshold=self.config.utilization_threshold,
+                    strategy=self.config.strategy,
                 )
                 if selection is not None:
                     lease = None
@@ -441,7 +533,68 @@ class GPUAllocator:
                         reserved_ids=reserved_ids,
                     )
                 )
+
+            now = time.time()
+            required_free_mib = math.ceil(request.memory_mib * self.config.memory_margin)
+            eligible_ids = tuple(
+                gpu.index
+                for gpu in gpus
+                if gpu.index not in set(reserved_ids)
+                and gpu.free_mib >= required_free_mib
+                and gpu.utilization_gpu <= self.config.utilization_threshold
+            )
+            status = AllocationStatus(
+                request=request,
+                required_free_mib=required_free_mib,
+                utilization_threshold=self.config.utilization_threshold,
+                reserved_ids=tuple(reserved_ids),
+                eligible_ids=eligible_ids,
+                gpus=tuple(gpus),
+                next_retry_in=self.config.poll_interval,
+                attempt=attempt,
+                strategy=self.config.strategy,
+            )
+            should_emit = self.config.watch and (
+                last_watch_time == 0.0 or now - last_watch_time >= self.config.watch_interval
+            )
+            if should_emit:
+                if status_callback is not None:
+                    status_callback(status)
+                else:
+                    print(format_status_line(status, verbose=self.config.verbose), file=sys.stderr, flush=True)
+                last_watch_time = now
             time.sleep(self.config.poll_interval)
+
+    def explain(self, request: AllocationRequest) -> AllocationStatus:
+        gpus = self.probe.query()
+        with self.lease_store.locked():
+            active_leases = self.lease_store.load_active_leases()
+            reserved_ids = sorted(
+                {
+                    gpu_id
+                    for lease in active_leases.values()
+                    for gpu_id in lease.gpu_ids
+                }
+            )
+        required_free_mib = math.ceil(request.memory_mib * self.config.memory_margin)
+        eligible_ids = tuple(
+            gpu.index
+            for gpu in gpus
+            if gpu.index not in set(reserved_ids)
+            and gpu.free_mib >= required_free_mib
+            and gpu.utilization_gpu <= self.config.utilization_threshold
+        )
+        return AllocationStatus(
+            request=request,
+            required_free_mib=required_free_mib,
+            utilization_threshold=self.config.utilization_threshold,
+            reserved_ids=tuple(reserved_ids),
+            eligible_ids=eligible_ids,
+            gpus=tuple(gpus),
+            next_retry_in=self.config.poll_interval,
+            attempt=1,
+            strategy=self.config.strategy,
+        )
 
     def _build_unavailable_message(
         self,
@@ -470,7 +623,7 @@ class LeaseHeartbeat:
         self.lease_store = lease_store
         self.lease = lease
         self.lease_seconds = lease_seconds
-        self.interval = max(1.0, lease_seconds / 3.0)
+        self.interval = min(max(lease_seconds / 3.0, 1.0), 15.0)
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, name="gpu-alloc-heartbeat", daemon=True)
 
@@ -618,12 +771,17 @@ def run_command_with_lease(
     previous_handlers: dict[int, object] = {}
 
     def _forward(signum, _frame) -> None:
+        if child is None:
+            return
         if child.poll() is None:
-            child.send_signal(signum)
+            try:
+                os.killpg(child.pid, signum)
+            except ProcessLookupError:
+                pass
 
     try:
         try:
-            child = subprocess.Popen(list(command), env=env)
+            child = subprocess.Popen(list(command), env=env, start_new_session=True)
         except OSError as exc:
             launch_error = exc
             raise
@@ -653,7 +811,7 @@ def run_command_with_lease(
                     exit_code=exit_code,
                     launch_error=launch_error,
                 )
-            except Exception as exc:  # pragma: no cover - best-effort notification path
+            except Exception as exc:  # pragma: no cover
                 print(f"Warning: failed to send completion email: {exc}", file=sys.stderr)
 
 
